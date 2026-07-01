@@ -2,35 +2,24 @@ import os
 import json
 import logging
 from flask import Flask, request, jsonify
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from truecallerpy import search, login, verify_otp
 import asyncio
-import threading
 
 # ============ CONFIGURATION ============
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Your bot token and deployment URL
-TELEGRAM_TOKEN = "8987138027:AAEjQqYk-8hB1pvnJZ3OQER3Nfi3FId7894"
-WEBHOOK_URL = "https://truecaller-production.up.railway.app"
-
-if not TELEGRAM_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN not set!")
-
 app = Flask(__name__)
 
-# ============ GLOBAL STATE (SINGLE ACCOUNT) ============
+# ============ GLOBAL STATE ============
 class TruecallerAccount:
-    """Single Truecaller account shared between Telegram bot and API"""
+    """Single Truecaller account"""
     
     def __init__(self):
         self.installation_id = None
         self.country_code = "IN"
         self.phone = None
         self.is_logged_in = False
-        self.waiting_for_otp = False
         self.otp_data = None
         self.phone_number = None
     
@@ -39,187 +28,192 @@ class TruecallerAccount:
         self.country_code = country_code
         self.phone = phone
         self.is_logged_in = True
-        self.waiting_for_otp = False
         self.otp_data = None
-        logger.info(f"✅ Truecaller logged in with: {phone}")
+        self.phone_number = None
+        logger.info(f"✅ Logged in with: {phone}")
+        return True
     
     def set_otp_request(self, phone, response):
         self.phone_number = phone
         self.otp_data = response
-        self.waiting_for_otp = True
         logger.info(f"📨 OTP requested for: {phone}")
+        return True
     
     def clear(self):
         self.installation_id = None
         self.country_code = "IN"
         self.phone = None
         self.is_logged_in = False
-        self.waiting_for_otp = False
         self.otp_data = None
         self.phone_number = None
-        logger.info("🔓 Account logged out")
+        logger.info("🔓 Logged out")
 
-# Global single account instance
+# Global account instance
 account = TruecallerAccount()
 
-# ============ TELEGRAM BOT - ONLY FOR LOGIN ============
-# Conversation states
-PHONE, OTP = range(2)
+# ============ API ENDPOINTS ============
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command - Only login functionality"""
+@app.route('/login', methods=['GET'])
+def api_login():
+    """
+    Step 1: Request OTP
+    GET /login?num=+918815743146
+    
+    Step 2: Verify OTP
+    GET /login?otp=123456
+    """
+    
+    # Check if already logged in
     if account.is_logged_in:
-        await update.message.reply_text(
-            f"✅ Already logged in!\n"
-            f"📱 Phone: {account.phone}\n"
-            f"🌍 Country: {account.country_code}\n\n"
-            "API is now active for everyone to search numbers.\n"
-            "To logout: /logout"
-        )
-        return ConversationHandler.END
+        return jsonify({
+            'success': True,
+            'message': 'Already logged in',
+            'phone': account.phone,
+            'status': 'logged_in'
+        })
     
-    await update.message.reply_text(
-        "🔐 *Login to Truecaller*\n\n"
-        "This will set up the account for the public API.\n\n"
-        "Enter your phone number in international format:\n"
-        "Example: +919876543210",
-        parse_mode="Markdown"
-    )
-    return PHONE
-
-async def phone_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle phone number input"""
-    phone = update.message.text.strip()
+    # ============ STEP 1: Request OTP ============
+    phone = request.args.get('num')
     
-    if not phone.startswith('+'):
-        await update.message.reply_text(
-            "❌ Invalid format!\n"
-            "Please enter with country code: +919876543210"
-        )
-        return PHONE
-    
-    try:
-        response = await login(phone)
+    if phone:
+        if not phone.startswith('+'):
+            return jsonify({
+                'success': False,
+                'error': 'Phone number must include country code',
+                'example': '+918815743146'
+            }), 400
         
-        if response.get('status') == 1 or response.get('message') == 'Sent':
-            account.set_otp_request(phone, response)
+        try:
+            # Run async function
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            response = loop.run_until_complete(login(phone))
+            loop.close()
             
-            await update.message.reply_text(
-                "📨 OTP sent via SMS/WhatsApp!\n"
-                "Enter the 6-digit code:"
-            )
-            return OTP
-        else:
-            error_msg = response.get('message', 'Unknown error')
-            await update.message.reply_text(
-                f"❌ Failed: {error_msg}\n\n"
-                "Check if you can login to Truecaller app."
-            )
-            return ConversationHandler.END
-            
-    except Exception as e:
-        logger.error(f"Login error: {e}")
-        await update.message.reply_text("❌ Server error. Try again.")
-        return ConversationHandler.END
-
-async def otp_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle OTP input"""
-    otp = update.message.text.strip()
+            if response.get('status') == 1 or response.get('message') == 'Sent':
+                account.set_otp_request(phone, response)
+                return jsonify({
+                    'success': True,
+                    'message': 'OTP sent successfully',
+                    'phone': phone,
+                    'status': 'otp_sent'
+                })
+            else:
+                error_msg = response.get('message', 'Unknown error')
+                return jsonify({
+                    'success': False,
+                    'error': error_msg,
+                    'message': 'Failed to send OTP. Check if account is valid.'
+                }), 400
+                
+        except Exception as e:
+            logger.error(f"Login error: {e}")
+            return jsonify({
+                'success': False,
+                'error': str(e)
+            }), 500
     
-    if not account.waiting_for_otp or not account.otp_data:
-        await update.message.reply_text(
-            "❌ No OTP request pending. Use /start again."
-        )
-        return ConversationHandler.END
+    # ============ STEP 2: Verify OTP ============
+    otp = request.args.get('otp')
     
-    try:
-        response = await verify_otp(
-            account.phone_number,
-            account.otp_data,
-            otp
-        )
+    if otp:
+        if not account.otp_data or not account.phone_number:
+            return jsonify({
+                'success': False,
+                'error': 'No OTP request pending. First call /login?num=+918815743146'
+            }), 400
         
-        if response.get('installationId'):
-            # Save the login data globally
-            account.set_login_data(
-                response['installationId'],
-                account.otp_data.get('parsedCountryCode', 'IN'),
-                account.phone_number
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            response = loop.run_until_complete(
+                verify_otp(
+                    account.phone_number,
+                    account.otp_data,
+                    otp
+                )
             )
+            loop.close()
             
-            await update.message.reply_text(
-                "✅ *Login Successful!*\n\n"
-                f"📱 Phone: {account.phone}\n"
-                f"🌍 Country: {account.country_code}\n\n"
-                "🔓 API is now ACTIVE!\n"
-                "Anyone can search numbers using:\n"
-                f"`GET {WEBHOOK_URL}/search?num=+919876543210`\n\n"
-                "To logout: /logout",
-                parse_mode="Markdown"
-            )
-            return ConversationHandler.END
-        else:
-            error = response.get('message', 'Invalid OTP')
-            await update.message.reply_text(
-                f"❌ {error}\n\n"
-                "Try again or /start to restart."
-            )
-            return OTP
-            
-    except Exception as e:
-        logger.error(f"OTP error: {e}")
-        await update.message.reply_text("❌ Server error. Try again.")
-        return ConversationHandler.END
+            if response.get('installationId'):
+                # Save login data
+                account.set_login_data(
+                    response['installationId'],
+                    account.otp_data.get('parsedCountryCode', 'IN'),
+                    account.phone_number
+                )
+                
+                return jsonify({
+                    'success': True,
+                    'message': 'Login successful!',
+                    'phone': account.phone,
+                    'country_code': account.country_code,
+                    'installation_id': account.installation_id,
+                    'status': 'logged_in'
+                })
+            else:
+                error = response.get('message', 'Invalid OTP')
+                return jsonify({
+                    'success': False,
+                    'error': error,
+                    'message': 'Invalid OTP. Try again.'
+                }), 400
+                
+        except Exception as e:
+            logger.error(f"OTP verification error: {e}")
+            return jsonify({
+                'success': False,
+                'error': str(e)
+            }), 500
+    
+    # ============ No parameters ============
+    return jsonify({
+        'error': 'Missing parameters',
+        'usage': {
+            'request_otp': '/login?num=+918815743146',
+            'verify_otp': '/login?otp=123456',
+            'check_status': '/status'
+        }
+    }), 400
 
-async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Logout the single account"""
-    account.clear()
-    await update.message.reply_text(
-        "🔓 Logged out successfully!\n"
-        "API is now inactive. Login again to activate."
-    )
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel conversation"""
-    await update.message.reply_text("Cancelled. Use /start to begin.")
-    return ConversationHandler.END
-
-# ============ FLASK API - PUBLIC SEARCH ============
 @app.route('/search', methods=['GET'])
 def api_search():
     """
-    Public API endpoint - Anyone can use this
+    Search phone number
     GET /search?num=+919876543210
     """
     
-    # Check if account is logged in
+    # Check if logged in
     if not account.is_logged_in:
         return jsonify({
-            'error': 'Truecaller account not logged in',
-            'message': 'Please login via Telegram bot first',
-            'telegram_bot': 'https://t.me/truecallerjs_bot'
+            'success': False,
+            'error': 'Not logged in',
+            'message': 'First login using /login?num=+918815743146',
+            'login_url': '/login?num=+918815743146'
         }), 401
     
-    # Get phone number from query parameter
+    # Get phone number
     phone = request.args.get('num')
     
     if not phone:
         return jsonify({
+            'success': False,
             'error': 'Missing phone number',
             'usage': '/search?num=+919876543210'
         }), 400
     
     if not phone.startswith('+'):
         return jsonify({
+            'success': False,
             'error': 'Phone number must include country code',
             'example': '+919876543210'
         }), 400
     
     try:
-        # Create new event loop for each request
+        # Search
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        
         result = loop.run_until_complete(
             search(
                 phone,
@@ -254,97 +248,89 @@ def api_search():
         if '40101' in error_str or 'Unauthorized' in error_str:
             account.clear()
             return jsonify({
+                'success': False,
                 'error': 'Session expired',
-                'message': 'Please re-login via Telegram bot'
+                'message': 'Please re-login using /login?num=+918815743146'
             }), 401
         
         return jsonify({
-            'error': 'Search failed',
-            'message': error_str
+            'success': False,
+            'error': str(e)
         }), 500
+
+
+@app.route('/logout', methods=['GET'])
+def api_logout():
+    """Logout - Clear account session"""
+    account.clear()
+    return jsonify({
+        'success': True,
+        'message': 'Logged out successfully'
+    })
+
 
 @app.route('/status', methods=['GET'])
 def api_status():
-    """Check if API is active"""
+    """Check login status"""
     return jsonify({
         'status': 'active' if account.is_logged_in else 'inactive',
         'phone': account.phone if account.is_logged_in else None,
         'country': account.country_code if account.is_logged_in else None,
+        'logged_in': account.is_logged_in,
         'message': 'Account logged in' if account.is_logged_in else 'Account not logged in'
     })
 
-@app.route('/health', methods=['GET'])
-def health():
-    """Health check for Railway"""
-    return jsonify({
-        'status': 'healthy',
-        'api': 'active' if account.is_logged_in else 'inactive (needs login)',
-        'server': 'running'
-    })
 
 @app.route('/', methods=['GET'])
 def home():
-    """Home page"""
+    """Home page with documentation"""
     return jsonify({
         'name': 'Truecaller Search API',
+        'version': '1.0.0',
         'status': 'active' if account.is_logged_in else 'inactive',
         'endpoints': {
-            '/search?num=+919876543210': 'Search phone number',
-            '/status': 'Check API status',
-            '/health': 'Health check'
+            '/login?num=+918815743146': {
+                'method': 'GET',
+                'description': 'Request OTP for login',
+                'params': {'num': 'Phone number with country code'}
+            },
+            '/login?otp=123456': {
+                'method': 'GET',
+                'description': 'Verify OTP and complete login',
+                'params': {'otp': '6-digit code received via SMS'}
+            },
+            '/search?num=+919876543210': {
+                'method': 'GET',
+                'description': 'Search phone number (after login)',
+                'params': {'num': 'Phone number to search'}
+            },
+            '/status': {
+                'method': 'GET',
+                'description': 'Check login status'
+            },
+            '/logout': {
+                'method': 'GET',
+                'description': 'Logout and clear session'
+            }
         },
-        'telegram_bot': 'https://t.me/truecallerjs_bot'
+        'example_flow': [
+            '1. GET /login?num=+918815743146  → OTP sent',
+            '2. GET /login?otp=123456         → Login successful',
+            '3. GET /search?num=+919876543210 → Search result'
+        ]
     })
 
-# ============ TELEGRAM BOT SETUP (FIXED) ============
-def run_telegram_bot():
-    """Run Telegram bot for login only - Fixed signal handler issue"""
-    
-    # Create a new event loop for this thread
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    # Build application with custom loop
-    application = Application.builder()\
-        .token(TELEGRAM_TOKEN)\
-        .build()
-    
-    # Conversation handler for login flow
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
-        states={
-            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_input)],
-            OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, otp_input)]
-        },
-        fallbacks=[
-            CommandHandler('cancel', cancel),
-            CommandHandler('logout', logout)
-        ]
-    )
-    
-    application.add_handler(conv_handler)
-    application.add_handler(CommandHandler('logout', logout))
-    
-    # Start bot with custom loop - this fixes the signal handler issue
-    try:
-        logger.info("🤖 Starting Telegram bot...")
-        application.run_polling()
-    except Exception as e:
-        logger.error(f"Bot error: {e}")
 
 # ============ MAIN ============
 if __name__ == '__main__':
-    port = int(os.getenv('PORT', 5000))
+    port = int(os.getenv('PORT', 8080))
     
-    # Start Telegram bot in background thread
-    bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
-    bot_thread.start()
+    logger.info("🚀 Truecaller Search API starting...")
+    logger.info(f"🌐 Running on port {port}")
+    logger.info("📝 Endpoints:")
+    logger.info("   /login?num=+918815743146  → Request OTP")
+    logger.info("   /login?otp=123456         → Verify OTP")
+    logger.info("   /search?num=+919876543210 → Search number")
+    logger.info("   /status                   → Check login status")
     
-    logger.info("🚀 Server starting...")
-    logger.info("📱 Telegram bot running for login")
-    logger.info(f"🌐 API running on port {port}")
-    logger.info(f"🔗 Webhook URL: {WEBHOOK_URL}")
-    logger.info("📝 Use: /search?num=+919876543210")
-    
-    # Start Flask API
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    app.run(host='0.0.0.0', port=port, debug=False)
