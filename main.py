@@ -12,7 +12,10 @@ import threading
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Your bot token and deployment URL
 TELEGRAM_TOKEN = "8987138027:AAEjQqYk-8hB1pvnJZ3OQER3Nfi3FId7894"
+WEBHOOK_URL = "https://truecaller-production.up.railway.app"
+
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN not set!")
 
@@ -150,7 +153,7 @@ async def otp_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🌍 Country: {account.country_code}\n\n"
                 "🔓 API is now ACTIVE!\n"
                 "Anyone can search numbers using:\n"
-                "`GET /search?num=+919876543210`\n\n"
+                f"`GET {WEBHOOK_URL}/search?num=+919876543210`\n\n"
                 "To logout: /logout",
                 parse_mode="Markdown"
             )
@@ -194,7 +197,7 @@ def api_search():
         return jsonify({
             'error': 'Truecaller account not logged in',
             'message': 'Please login via Telegram bot first',
-            'telegram_bot': '@your_bot_username'  # Change this
+            'telegram_bot': 'https://t.me/truecallerjs_bot'
         }), 401
     
     # Get phone number from query parameter
@@ -213,7 +216,7 @@ def api_search():
         }), 400
     
     try:
-        # Use the single logged-in account
+        # Create new event loop for each request
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
@@ -247,7 +250,8 @@ def api_search():
         logger.error(f"Search error: {e}")
         
         # Check if session expired
-        if '40101' in str(e) or 'Unauthorized' in str(e):
+        error_str = str(e)
+        if '40101' in error_str or 'Unauthorized' in error_str:
             account.clear()
             return jsonify({
                 'error': 'Session expired',
@@ -256,7 +260,7 @@ def api_search():
         
         return jsonify({
             'error': 'Search failed',
-            'message': str(e)
+            'message': error_str
         }), 500
 
 @app.route('/status', methods=['GET'])
@@ -274,13 +278,36 @@ def health():
     """Health check for Railway"""
     return jsonify({
         'status': 'healthy',
-        'api': 'active' if account.is_logged_in else 'inactive (needs login)'
+        'api': 'active' if account.is_logged_in else 'inactive (needs login)',
+        'server': 'running'
     })
 
-# ============ TELEGRAM BOT SETUP ============
+@app.route('/', methods=['GET'])
+def home():
+    """Home page"""
+    return jsonify({
+        'name': 'Truecaller Search API',
+        'status': 'active' if account.is_logged_in else 'inactive',
+        'endpoints': {
+            '/search?num=+919876543210': 'Search phone number',
+            '/status': 'Check API status',
+            '/health': 'Health check'
+        },
+        'telegram_bot': 'https://t.me/truecallerjs_bot'
+    })
+
+# ============ TELEGRAM BOT SETUP (FIXED) ============
 def run_telegram_bot():
-    """Run Telegram bot for login only"""
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    """Run Telegram bot for login only - Fixed signal handler issue"""
+    
+    # Create a new event loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # Build application with custom loop
+    application = Application.builder()\
+        .token(TELEGRAM_TOKEN)\
+        .build()
     
     # Conversation handler for login flow
     conv_handler = ConversationHandler(
@@ -298,8 +325,12 @@ def run_telegram_bot():
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler('logout', logout))
     
-    # Start bot
-    application.run_polling()
+    # Start bot with custom loop - this fixes the signal handler issue
+    try:
+        logger.info("🤖 Starting Telegram bot...")
+        application.run_polling()
+    except Exception as e:
+        logger.error(f"Bot error: {e}")
 
 # ============ MAIN ============
 if __name__ == '__main__':
@@ -312,7 +343,8 @@ if __name__ == '__main__':
     logger.info("🚀 Server starting...")
     logger.info("📱 Telegram bot running for login")
     logger.info(f"🌐 API running on port {port}")
+    logger.info(f"🔗 Webhook URL: {WEBHOOK_URL}")
     logger.info("📝 Use: /search?num=+919876543210")
     
     # Start Flask API
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
